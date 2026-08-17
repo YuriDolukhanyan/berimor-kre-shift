@@ -1,0 +1,1 @@
+worker: python berimor_kre.py
