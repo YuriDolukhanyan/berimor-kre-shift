@@ -8,8 +8,8 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 # Config
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-TZ = ZoneInfo("Asia/Yerevan") # Armenia time (UTC+4)
-PERSON = "Kren" # display name in replies
+TZ = ZoneInfo("Asia/Yerevan")  # Armenia time (UTC+4)
+PERSON = "Kren"                # display name in replies
 
 # How long the bot keeps waiting for a date after asking "erb?"
 PENDING_TTL = timedelta(minutes=10)
@@ -32,6 +32,8 @@ def shift_for(d: date) -> str:
 NAME_RE = re.compile(r"\b(kre|kar|atabek|կրե|կար|աթաբեկ)\w*", re.IGNORECASE)
 # work words: gorc(i), ashxat(anq/el/um), smen, airport...
 WORK_RE = re.compile(r"(gorc|ashxat|smen|airport|aeroport|գործ|աշխատ|սմեն)", re.IGNORECASE)
+# free word: azat / ազատ
+AZAT_RE = re.compile(r"(azat|ազատ)", re.IGNORECASE)
 
 # Armenian weekdays -> Python weekday() (Mon=0 … Sun=6)
 WEEKDAYS = {
@@ -116,16 +118,21 @@ def resolve_date(text: str, today: date):
 
     return None  # nothing found
 
-def render(s: str, label: str, d: date) -> str:
+def render(s: str, label: str, d: date, mode: str) -> str:
     ds = d.strftime("%d.%m.%Y")
+    if mode == "free":
+        if s == OFF:
+            return "հա ազատ ա ցավդ տանեմ"
+        return "չէ զբաղված ա ախպերս"
+    # work mode
     if s == DAY:
-        return f"հա ցավդ տանեմ, ցերեկվա սմեն"
+        return "հա ցավդ տանեմ, ցերեկվա սմեն"
     if s == NIGHT:
-        return f"հա ընգերս, գիշերային պախատ"
-    return f"չէ բռատս, ազատ ա"
+        return "հա ընգերս, գիշերային պախատ"
+    return "չէ բռատս, ազատ ա"
 
-def answer(target: date, label: str) -> str:
-    return render(shift_for(target), label, target)
+def answer(target: date, label: str, mode: str) -> str:
+    return render(shift_for(target), label, target, mode)
 
 # Handler
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,20 +141,27 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
     today = datetime.now(TZ).date()
 
-    # A real question needs BOTH a name and a work word.
-    is_question = bool(NAME_RE.search(text) and WORK_RE.search(text))
+    # A real question needs a name + (a work word OR the free word "azat").
+    has_name = bool(NAME_RE.search(text))
+    has_azat = bool(AZAT_RE.search(text))
+    has_work = bool(WORK_RE.search(text))
+    is_question = has_name and (has_work or has_azat)
+    # if "azat" is present, answer in free/busy wording
+    mode = "free" if has_azat else "work"
 
     if is_question:
         result = resolve_date(text, today)
         if result is None:
-            # no date given: ask "when?" and start waiting
+            # no date given: ask "when?" and start waiting (remember the mode)
             context.chat_data["awaiting_since"] = datetime.now(TZ)
+            context.chat_data["awaiting_mode"] = mode
             await update.message.reply_text("ե՞րբ ցավդ տանեմ")
             return
         # date given: answer and stop waiting
         context.chat_data.pop("awaiting_since", None)
+        context.chat_data.pop("awaiting_mode", None)
         target, label = result
-        await update.message.reply_text(answer(target, label))
+        await update.message.reply_text(answer(target, label, mode))
         return
 
     # not a full question: maybe it's the answer to a previous "erb?"
@@ -155,9 +169,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if awaiting and datetime.now(TZ) - awaiting <= PENDING_TTL:
         result = resolve_date(text, today)
         if result is not None:
+            saved_mode = context.chat_data.get("awaiting_mode", "work")
             context.chat_data.pop("awaiting_since", None)
+            context.chat_data.pop("awaiting_mode", None)
             target, label = result
-            await update.message.reply_text(answer(target, label))
+            await update.message.reply_text(answer(target, label, saved_mode))
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
