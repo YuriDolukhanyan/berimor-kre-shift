@@ -8,8 +8,8 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 # Config
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-TZ = ZoneInfo("Asia/Yerevan")  # Armenia time (UTC+4)
-PERSON = "Kren"                # display name in replies
+TZ = ZoneInfo("Asia/Yerevan") # Armenia time (UTC+4)
+PERSON = "Kren" # display name in replies
 
 # How long the bot keeps waiting for a date after asking "erb?"
 PENDING_TTL = timedelta(minutes=10)
