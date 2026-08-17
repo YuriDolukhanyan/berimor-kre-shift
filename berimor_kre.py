@@ -119,7 +119,7 @@ def resolve_date(text: str, today: date):
 def render(s: str, label: str, d: date) -> str:
     ds = d.strftime("%d.%m.%Y")
     if s == DAY:
-        return f"հա ցավդ տանեմ, գործի ա ցերեկվա սմեն"
+        return f"հա ցավդ տանեմ, ցերեկվա սմեն"
     if s == NIGHT:
         return f"հա ընգերս, գիշերային պախատ"
     return f"չէ բռատս, ազատ ա"
