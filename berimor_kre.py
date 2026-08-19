@@ -9,7 +9,7 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 # Config
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 TZ = ZoneInfo("Asia/Yerevan")  # Armenia time (UTC+4)
-PERSON = "Kre"                # display name in replies
+PERSON = "Kre"                 # display name in replies
 
 # How long the bot keeps waiting for a date after asking "erb?"
 PENDING_TTL = timedelta(minutes=10)
@@ -98,13 +98,13 @@ def resolve_date(text: str, today: date):
             return next_weekday(today, wd), key
 
     # today (esor / aysor / էսօր / այսօր)
-    if re.search(r"(esor|aysor|hima|hmi|էսօր|այսօր|հիմա|հմի|)", text):
+    if re.search(r"(esor|aysor|hima|hmi|էսօր|այսօր|հիմա|հմի)", text):
         return today, "esor"
     # tomorrow (vaghy / vagy / vaxy / վաղը)
     if re.search(r"(vag|vax|վաղ)", text):
         return today + timedelta(days=1), "vaghy"
     # yesterday (erek / էrek / երեկ / էրեկ)
-    if re.search(r"(erek|ereg|երեկ|էրեկ|երեգ|էրէգ|)", text):
+    if re.search(r"(erek|ereg|երեկ|էրեկ|երեգ|էրէգ)", text):
         return today - timedelta(days=1), "erek"
 
     # bare day number -> that day of the CURRENT month  e.g. "26in"
