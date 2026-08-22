@@ -1,9 +1,10 @@
 import os
 import re
+import random
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import Update
+from telegram import Update, ReplyParameters
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 # Config
@@ -34,6 +35,31 @@ NAME_RE = re.compile(r"\b(kre|kar|atabek|kapat|chax|chagh|karabas|barabas|կապ
 WORK_RE = re.compile(r"(gorc|gordz|gorts|ashxat|ashkhat|smen|airport|aeroport|աերոպորտ|օդանավ|գորձ|գործ|աշխատ|սմեն)", re.IGNORECASE)
 # free word: azat / ազատ
 AZAT_RE = re.compile(r"(azat|ազատ)", re.IGNORECASE)
+
+# summon words / bot tag -> acknowledge
+SUMMON_RE = re.compile(r"(berimor|բերիմոր|բերիմոռ|բեռիմոր|բեռիմոռ|@berimor_kre_shift_bot)", re.IGNORECASE)
+SUMMON_REPLIES = [
+    "այո, սըր",
+    "լսում եմ, սըր",
+    "լսում և հնազանդվում եմ, օ՜ իմ տիրակալ",
+]
+
+# insult words -> insult back with "<word> berimor"
+INSULT_RE = re.compile(
+    r"(himar|tavar|anasun|takanq|vaxkot|vakhkot|hambal|"
+    r"hin ev cer|hin ev tser|hin u cer|hin u tser|"
+    r"հիմար|տավար|անասուն|տականք|վախկոտ|համբալ|հին և ծեր|հին ու ծեր)",
+    re.IGNORECASE,
+)
+INSULT_REPLIES = [
+    "հիմար բերիմոր",
+    "տավար բերիմոր",
+    "անասուն բերիմոր",
+    "տականք բերիմոր",
+    "վախկոտ բերիմոր",
+    "համբալ բերիմոր",
+    "հին և ծեր բերիմոր",
+]
 
 # Armenian weekdays -> Python weekday() (Mon=0 … Sun=6)
 WEEKDAYS = {
@@ -134,6 +160,21 @@ def render(s: str, label: str, d: date, mode: str) -> str:
 def answer(target: date, label: str, mode: str) -> str:
     return render(shift_for(target), label, target, mode)
 
+def quote_params(message, pattern):
+    """Build ReplyParameters that quote the exact keyword `pattern` matched in `message.text`."""
+    original = message.text or ""
+    m = pattern.search(original)
+    if not m:
+        return None
+    quoted = original[m.start():m.end()]
+    # Telegram offsets are counted in UTF-16 code units, not Python code points.
+    position = len(original[:m.start()].encode("utf-16-le")) // 2
+    return ReplyParameters(
+        message_id=message.message_id,
+        quote=quoted,
+        quote_position=position,
+    )
+
 # Handler
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -174,6 +215,23 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.chat_data.pop("awaiting_mode", None)
             target, label = result
             await update.message.reply_text(answer(target, label, saved_mode))
+            return
+
+    # insult -> reply, quoting the exact keyword that triggered it (1/7 each)
+    if INSULT_RE.search(text):
+        reply = random.choice(INSULT_REPLIES)
+        rp = quote_params(update.message, INSULT_RE)
+        try:
+            await update.message.reply_text(reply, reply_parameters=rp)
+        except Exception:
+            # if the partial-quote is rejected, fall back to a normal reply
+            await update.message.reply_text(reply)
+        return
+
+    # summon (word or @tag) -> random acknowledgement (1/3 each)
+    if SUMMON_RE.search(text):
+        await update.message.reply_text(random.choice(SUMMON_REPLIES))
+        return
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
