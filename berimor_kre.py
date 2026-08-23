@@ -31,8 +31,8 @@ def shift_for(d: date) -> str:
 # Keyword matching
 # name roots (kre/kren/krem/kremush/kremy, kar/karo/karapet, atabek/atabekyan)
 NAME_RE = re.compile(r"\b(kre|kar|atabek|kapat|chax|chagh|karabas|barabas|կապատ|չաղ|կարաբաս|կառաբաս|բարաբաս|բառաբաս|կրե|կար|աթաբեկ)\w*", re.IGNORECASE)
-# work words: gorc(i), ashxat(anq/el/um), smen, airport...
-WORK_RE = re.compile(r"(gorc|gordz|gorts|ashxat|ashkhat|smen|airport|aeroport|աերոպորտ|օդանավ|գորձ|գործ|աշխատ|սմեն)", re.IGNORECASE)
+# work words: gorc(i), ashxat(anq/el/um), smen, airport, zbaghvats (busy)...
+WORK_RE = re.compile(r"(gorc|gordz|gorts|ashxat|ashkhat|smen|airport|aeroport|zbaghvats|zbaghvac|zbaxvac|աերոպորտ|օդանավ|գորձ|գործ|աշխատ|սմեն|զբաղված)", re.IGNORECASE)
 # free word: azat / ազատ
 AZAT_RE = re.compile(r"(azat|ազատ)", re.IGNORECASE)
 
