@@ -1,0 +1,6 @@
+# Only needed if your Railway service uses the older NIXPACKS builder.
+# If you're on Railpack (Railway's default now), you don't need this file —
+# set the RAILPACK_DEPLOY_APT_PACKAGES=ffmpeg variable instead.
+# The "..." keeps the auto-detected Python packages and just ADDS ffmpeg.
+[phases.setup]
+nixPkgs = ["...", "ffmpeg"]
