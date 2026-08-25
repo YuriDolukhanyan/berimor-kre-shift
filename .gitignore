@@ -1,0 +1,14 @@
+# never commit your YouTube session
+cookies.txt
+
+# local media / downloads
+new_downloads/
+downloads/
+*.mp4
+*.mp3
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
