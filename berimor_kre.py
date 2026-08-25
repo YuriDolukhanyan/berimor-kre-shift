@@ -1,11 +1,25 @@
 import os
 import re
 import random
+import asyncio
+import shutil
+import tempfile
+import logging
+from pathlib import Path
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update, ReplyParameters
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    CommandHandler,
+    filters,
+    ContextTypes,
+)
+
+# NEW: media helpers (download + convert). Lives in berimor_media.py next to this file.
+from berimor_media import download_clip, convert_to_mp3, MediaError, DEFAULT_FADE_SEC
 
 # Config
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -19,6 +33,20 @@ PENDING_TTL = timedelta(minutes=10)
 ANCHOR = date(2026, 8, 4)
 
 DAY, NIGHT, OFF = "day", "night", "off"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("berimor")
+
+# Only one heavy download/encode job at a time (safe for small dynos).
+# Raise to Semaphore(2) if your host has spare CPU/RAM.
+JOB_SEMAPHORE = asyncio.Semaphore(1)
+
+# Telegram Bot API upload limit for regular bots.
+TELEGRAM_MAX_MB = 50
+
 
 def shift_for(d: date) -> str:
     pos = (d - ANCHOR).days % 4  # Python % is always >= 0
@@ -123,7 +151,7 @@ def resolve_date(text: str, today: date):
         if re.search(rf"\b{key}", text):
             return next_weekday(today, wd), key
 
-    # today (esor / aysor / էսօր / այսօր)
+    # today (esor / aysor / էsor / այսօր)
     if re.search(r"(esor|aysor|hima|hmi|էսօր|այսօր|հիմա|հմի)", text):
         return today, "esor"
     # tomorrow (vaghy / vagy / vaxy / վաղը)
@@ -174,6 +202,153 @@ def quote_params(message, pattern):
         quote=quoted,
         quote_position=position,
     )
+
+# ===========================================================================
+# NEW: /clip — download a YouTube section as MP4 (1080p, fade) + MP3
+# ===========================================================================
+CLIP_USAGE = (
+    "🎬 *Clip downloader*\n\n"
+    "Send:\n"
+    "`/clip <youtube-url> <start> <end> [fade]`\n\n"
+    "Times can be `M:SS`, `H:MM:SS`, or plain seconds.\n\n"
+    "Examples:\n"
+    "`/clip https://youtu.be/LYU-8IFcDPw 0:31 0:51`\n"
+    "`/clip https://youtu.be/LYU-8IFcDPw 0:31 0:51 1`   (1s fade)\n\n"
+    "Old 4-number style also works:\n"
+    "`/clip <url> 0 31 0 51`   (start_min start_sec end_min end_sec)"
+)
+
+
+def parse_timecode(token: str) -> int:
+    """'0:31' -> 31, '1:02:03' -> 3723, '45' -> 45 seconds. Raises ValueError."""
+    token = token.strip()
+    if not re.fullmatch(r"\d{1,2}(:\d{1,2}){0,2}", token):
+        raise ValueError(f"bad time '{token}'")
+    parts = [int(p) for p in token.split(":")]
+    if len(parts) == 1:
+        h, m, s = 0, 0, parts[0]
+    elif len(parts) == 2:
+        h, m, s = 0, parts[0], parts[1]
+    else:
+        h, m, s = parts
+    if m > 59 or s > 59:
+        raise ValueError(f"minutes/seconds must be 0..59 in '{token}'")
+    return h * 3600 + m * 60 + s
+
+
+def parse_clip_args(args: list[str]) -> tuple[str, int, int, float]:
+    """
+    Accepts, after the /clip command:
+        <url> <start> <end> [fade]                (timecode style)
+        <url> <s_min> <s_sec> <e_min> <e_sec> [fade]   (old 4-number style)
+    Returns (url, start_sec, end_sec, fade). Raises ValueError with a message.
+    """
+    if len(args) < 3:
+        raise ValueError("Not enough arguments.")
+    url = args[0]
+    rest = args[1:]
+
+    if len(rest) in (2, 3):            # timecode style
+        start = parse_timecode(rest[0])
+        end = parse_timecode(rest[1])
+        fade = float(rest[2]) if len(rest) == 3 else DEFAULT_FADE_SEC
+    elif len(rest) in (4, 5):          # old 4-number style
+        s_min, s_sec, e_min, e_sec = (int(rest[0]), int(rest[1]), int(rest[2]), int(rest[3]))
+        if not (0 <= s_sec < 60 and 0 <= e_sec < 60):
+            raise ValueError("seconds must be 0..59")
+        start = s_min * 60 + s_sec
+        end = e_min * 60 + e_sec
+        fade = float(rest[4]) if len(rest) == 5 else DEFAULT_FADE_SEC
+    else:
+        raise ValueError("Wrong number of arguments.")
+
+    if fade < 0:
+        raise ValueError("fade must be >= 0")
+    if end <= start:
+        raise ValueError("End time must be after start time.")
+    return url, start, end, fade
+
+
+async def clip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    try:
+        url, start, end, fade = parse_clip_args(context.args)
+    except ValueError as e:
+        await update.message.reply_text(
+            f"⚠️ {e}\n\n{CLIP_USAGE}", parse_mode="Markdown"
+        )
+        return
+
+    status = await update.message.reply_text("⏳ Resolving the video…")
+    workdir = Path(tempfile.mkdtemp(prefix="berimor_clip_"))
+
+    async with JOB_SEMAPHORE:
+        try:
+            # 1) Download + cut + fade + normalize to 1080p (blocking -> thread)
+            await status.edit_text("⬇️ Downloading & encoding 1080p… this can take a bit.")
+            result = await asyncio.to_thread(
+                download_clip, url, start, end, workdir, fade=fade
+            )
+
+            # Warn if YouTube only served a sub-1080p source (usually needs PO token)
+            if result.height and result.height < 1080:
+                await update.message.reply_text(
+                    f"ℹ️ YouTube only served {result.width}x{result.height} for this "
+                    "video (likely needs a PO token / cookies on the server), so the "
+                    "MP4 is padded to 1080p rather than truly 1080p."
+                )
+
+            # 2) Convert to MP3 (blocking -> thread)
+            await status.edit_text("🎧 Converting to MP3…")
+            mp3_path = await asyncio.to_thread(convert_to_mp3, result.mp4_path)
+
+            # 3) Send both files back
+            await status.edit_text("📤 Uploading files…")
+            mp4_mb = result.mp4_path.stat().st_size / (1024 * 1024)
+
+            # ---- MP4 ----
+            if mp4_mb > TELEGRAM_MAX_MB:
+                await update.message.reply_text(
+                    f"⚠️ The MP4 is {mp4_mb:.0f} MB, above Telegram's "
+                    f"{TELEGRAM_MAX_MB} MB bot limit, so I can't send it here. "
+                    "Try a shorter range. Sending the MP3 only."
+                )
+            else:
+                with open(result.mp4_path, "rb") as fh:
+                    await update.message.reply_document(
+                        document=fh,
+                        filename=result.mp4_path.name,
+                        caption=f"🎬 {result.title}",
+                        read_timeout=600, write_timeout=600, connect_timeout=60,
+                    )
+
+            # ---- MP3 ----
+            with open(mp3_path, "rb") as fh:
+                await update.message.reply_audio(
+                    audio=fh,
+                    filename=mp3_path.name,
+                    title=result.title,
+                    read_timeout=600, write_timeout=600, connect_timeout=60,
+                )
+
+            await status.delete()
+
+        except MediaError as e:
+            log.warning("clip failed: %s", e)
+            await status.edit_text(f"❌ {e}")
+        except Exception as e:  # noqa: BLE001 - report anything unexpected
+            log.exception("unexpected clip error")
+            await status.edit_text(f"❌ Unexpected error: {e}")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text(CLIP_USAGE, parse_mode="Markdown")
+
 
 # Handler
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,7 +410,14 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # NEW: commands (these never reach the schedule handler, which excludes commands)
+    app.add_handler(CommandHandler("clip", clip_command))
+    app.add_handler(CommandHandler(["start", "help"], start_command))
+
+    # Existing schedule / banter handler (unchanged)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
     print("Bot runnin'")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
