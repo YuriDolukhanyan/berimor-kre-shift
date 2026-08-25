@@ -15,23 +15,32 @@ All the download FEATURES are preserved exactly:
   * single ffmpeg pass with fast input seek (-ss before -i)
   * cookies support (for logged-in / bot-check bypass)
 
+YouTube (2026) requires a JavaScript runtime + a challenge-solver to hand over
+real formats. We resolve the video by invoking the `yt-dlp` binary with the
+exact flags proven to work on the server:
+  --js-runtimes deno:<path>   (Deno solves the JS challenges)
+  --remote-components ejs:github   (downloads the EJS solver script)
+  --extractor-args youtube:player_client=web,tv
+  --cookies <cookies.txt>
+Doing it via the binary avoids guessing yt-dlp's new library-option names.
+
 The CLI parts (typer, rich) are removed because there is no console in a
-bot; status is reported back to Telegram instead. Nothing functional was
-dropped. These functions are synchronous and BLOCKING on purpose — the bot
-runs them inside asyncio.to_thread so the event loop stays responsive.
+bot; status is reported back to Telegram instead. These functions are
+synchronous and BLOCKING on purpose — the bot runs them inside
+asyncio.to_thread so the event loop stays responsive.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import sys
+import json
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-
-import yt_dlp
 
 
 class MediaError(Exception):
@@ -41,11 +50,14 @@ class MediaError(Exception):
 # ---------------------------------------------------------------------------
 # Configuration (override via environment variables where noted)
 # ---------------------------------------------------------------------------
-DEFAULT_FADE_SEC = 0.5          # fade in / out duration in seconds
-CANVAS_W         = 1920         # output width  (16:9 · 1080p)
-CANVAS_H         = 1080         # output height
+DEFAULT_FADE_SEC = 0.5      # fade in / out duration in seconds
+CANVAS_W         = 1920     # output width  (16:9 · 1080p)
+CANVAS_H         = 1080     # output height
 PAD_COLOR        = "black"
-AUDIO_BITRATE    = "192k"       # MP3 bitrate
+AUDIO_BITRATE    = "192k"   # MP3 bitrate
+
+# Where Deno lives on the server (override with DENO_PATH if different).
+DEFAULT_DENO_PATH = "/home/ubuntu/.deno/bin/deno"
 
 # Prefer exact 1080p H.264 / AAC. Fall back gracefully if 1080p isn't offered.
 FORMAT_SELECTOR = (
@@ -59,10 +71,8 @@ FORMAT_SELECTOR = (
     "/b[height<=1080]"
 )
 
-# Let yt-dlp manage its default player_client list (it changes per release to
-# keep up with YouTube). With the bgutil PO-token provider installed this lets
-# the `web` client serve 1080p+.
-PLAYER_CLIENTS = ["default"]
+# YouTube player clients that serve 1080p when the JS challenge is solved.
+PLAYER_CLIENTS = ["web", "tv"]
 
 
 @dataclass
@@ -75,7 +85,7 @@ class ClipResult:
 
 
 # ---------------------------------------------------------------------------
-# ffmpeg / cookies discovery (works on Windows dev box AND Linux server)
+# ffmpeg / yt-dlp / cookies discovery
 # ---------------------------------------------------------------------------
 def find_ffmpeg(explicit: str | os.PathLike | None = None) -> Path:
     """
@@ -100,10 +110,33 @@ def find_ffmpeg(explicit: str | os.PathLike | None = None) -> Path:
     if found:
         return Path(found)
     raise MediaError(
-        "ffmpeg was not found. On the server install it via the apt buildpack "
-        "(Aptfile with `ffmpeg`); locally put ffmpeg.exe next to the script or "
-        "set the FFMPEG_PATH environment variable."
+        "ffmpeg was not found. On the server: sudo apt -y install ffmpeg; "
+        "locally put ffmpeg.exe next to the script or set FFMPEG_PATH."
     )
+
+
+def _ytdlp_bin() -> str:
+    """Find the yt-dlp executable (prefer the one in this venv)."""
+    cand = Path(sys.executable).with_name("yt-dlp")
+    if cand.exists():
+        return str(cand)
+    found = shutil.which("yt-dlp")
+    if found:
+        return found
+    raise MediaError(
+        "yt-dlp executable not found. Activate the venv and run: pip install -U yt-dlp"
+    )
+
+
+def _deno_flag() -> list[str]:
+    """Return ['--js-runtimes', 'deno:<path>'] if Deno is present, else []."""
+    deno = os.environ.get("DENO_PATH", DEFAULT_DENO_PATH)
+    if Path(deno).exists():
+        return ["--js-runtimes", f"deno:{deno}"]
+    found = shutil.which("deno")
+    if found:
+        return ["--js-runtimes", f"deno:{found}"]
+    return []  # yt-dlp will still try, but challenge solving may fail
 
 
 def resolve_cookies(explicit: str | os.PathLike | None = None) -> Path | None:
@@ -111,10 +144,9 @@ def resolve_cookies(explicit: str | os.PathLike | None = None) -> Path | None:
     Find a cookies file. Priority:
       1. explicit path argument
       2. YT_COOKIES_FILE env var (a path)
-      3. YT_COOKIES_B64 env var (base64 of the file — recommended on Railway,
-         because it stays a single line and no newlines get mangled)
-      4. YT_COOKIES env var (the raw file *contents* — written to a temp file)
-      5. cookies.txt next to this file (your local setup)
+      3. YT_COOKIES_B64 env var (base64 of the file)
+      4. YT_COOKIES env var (raw file contents -> temp file)
+      5. cookies.txt next to this file (your server/local setup)
     Returns None if no cookies are configured.
     """
     if explicit:
@@ -214,28 +246,49 @@ def build_audio_filter(duration: int, fade: float) -> str | None:
     return f"afade=t=in:st=0:d={f},afade=t=out:st={out_start}:d={f}"
 
 
-class _QuietLogger:
-    def debug(self, msg):   pass
-    def info(self, msg):    pass
-    def warning(self, msg): pass
-    def error(self, msg):   pass
-
-
-def _ydl_opts(cookies_file: Path | None) -> dict:
-    opts: dict = {
-        "format": FORMAT_SELECTOR,
-        "quiet": True,
-        "no_warnings": True,
-        "logger": _QuietLogger(),
-        "extractor_args": {"youtube": {"player_client": PLAYER_CLIENTS}},
-    }
+# ---------------------------------------------------------------------------
+# Resolve stream info via the yt-dlp binary (Deno + EJS + web/tv clients)
+# ---------------------------------------------------------------------------
+def _resolve_info(url: str, cookies_file: Path | None) -> dict:
+    ytdlp = _ytdlp_bin()
+    cmd = [
+        ytdlp,
+        "-J", "--no-warnings",
+        "-f", FORMAT_SELECTOR,
+        "--extractor-args", "youtube:player_client=" + ",".join(PLAYER_CLIENTS),
+        "--remote-components", "ejs:github",
+    ]
+    cmd += _deno_flag()
     if cookies_file:
-        opts["cookiefile"] = str(cookies_file)
-    return opts
+        cmd += ["--cookies", str(cookies_file)]
+    cmd += [url]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired as e:
+        raise MediaError("Timed out while reading the video from YouTube.") from e
+
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or "").strip().splitlines()[-4:]) or "unknown error"
+        raise MediaError(f"Could not read that video:\n{tail}")
+
+    try:
+        info = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise MediaError(f"Could not parse video info from yt-dlp: {e}") from e
+
+    # Single progressive file fallback: -J puts it under requested_downloads.
+    if not info.get("requested_formats") and not info.get("url"):
+        rd = info.get("requested_downloads")
+        if rd and rd[0].get("url"):
+            info["url"] = rd[0]["url"]
+            info["http_headers"] = rd[0].get("http_headers", info.get("http_headers"))
+
+    return info
 
 
 # ---------------------------------------------------------------------------
-# Core download + cut (ported from berimor.py)
+# Core download + cut (ported from berimor.py — unchanged features)
 # ---------------------------------------------------------------------------
 def _download_and_cut(ffmpeg: Path, info: dict, start: int, end: int,
                       fade: float, dst: Path) -> None:
@@ -243,7 +296,6 @@ def _download_and_cut(ffmpeg: Path, info: dict, start: int, end: int,
     cmd: list[str] = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y"]
 
     fmts = info.get("requested_formats")
-
     if fmts and len(fmts) >= 2:
         video_fmt = next((f for f in fmts if f.get("vcodec") not in (None, "none")), fmts[0])
         audio_fmt = next((f for f in fmts if f.get("acodec") not in (None, "none")
@@ -255,11 +307,9 @@ def _download_and_cut(ffmpeg: Path, info: dict, start: int, end: int,
         if v_hdrs:
             cmd += ["-headers", v_hdrs]
         cmd += ["-ss", str(start), "-i", video_fmt["url"]]
-
         if a_hdrs:
             cmd += ["-headers", a_hdrs]
         cmd += ["-ss", str(start), "-i", audio_fmt["url"]]
-
         cmd += ["-t", str(duration), "-map", "0:v:0", "-map", "1:a:0"]
     else:
         hdrs = headers_to_arg(info.get("http_headers"))
@@ -302,13 +352,7 @@ def download_clip(url: str, start_sec: int, end_sec: int, out_dir: str | os.Path
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    opts = _ydl_opts(cookies)
-    opts["skip_download"] = True
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError as e:
-        raise MediaError(f"Could not read that video: {e}") from e
+    info = _resolve_info(url, cookies)
 
     dims = source_dimensions(info)
     w, h = dims if dims else (None, None)
