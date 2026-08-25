@@ -1,1 +1,2 @@
-python-telegram-bot>=21
+python-telegram-bot>=21.0
+yt-dlp>=2025.1.1
