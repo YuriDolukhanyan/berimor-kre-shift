@@ -98,7 +98,7 @@ INSULT_REPLIES = [
 # cinema words -> reply "kinaciatr"
 # prefix match, so "kinoyi", "filmy", "tatronum", "կինոյի", "թատրոնում" also trigger
 KINO_RE = re.compile(
-    r"\b(kino|kinotatron|kinaciatr|film|movie|theatre|theater|tatron|Dav"
+    r"\b(kino|kinotatron|kinaciatr|film|movie|theatre|theater|tatron|Dav|"
     r"կինո|կինոթատրոն|կինածիատր|ֆիլմ|մուվի|թատրոն|Դավ)",
     re.IGNORECASE,
 )
