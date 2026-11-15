@@ -57,12 +57,18 @@ def shift_for(d: date) -> str:
     return OFF
 
 # Keyword matching
-# name roots (kre/kren/krem/kremush/kremy, kar/karo/karapet, atabek/atabekyan)
-NAME_RE = re.compile(r"\b(kre|kar|atabek|kapat|chax|chagh|karabas|barabas|կապատ|չաղ|կարաբաս|կառաբաս|բարաբաս|բառաբաս|կրե|կար|աթաբեկ)\w*", re.IGNORECASE)
+# name roots (kre/kren/krem/kremush/kremy, atabek/atabekyan, ...)
+NAME_RE = re.compile(r"\b(kre|atabek|kapat|chax|chagh|karabas|barabas|կապատ|չաղ|կարաբաս|կառաբաս|բարաբաս|բառաբաս|կրե|աթաբեկ)\w*", re.IGNORECASE)
 # work words: gorc(i), ashxat(anq/el/um), smen, airport, zbaghvats (busy)...
 WORK_RE = re.compile(r"(gorc|gordz|gorts|ashxat|ashkhat|smen|airport|aeroport|zbaghvats|zbaghvac|zbaxvac|աերոպորտ|օդանավ|գորձ|գործ|աշխատ|սմեն|զբաղված)", re.IGNORECASE)
 # free word: azat / ազատ
 AZAT_RE = re.compile(r"(azat|ազատ)", re.IGNORECASE)
+
+# "self" words (es / ես) -> stand in for the name, but ONLY for SELF_USER_ID.
+# Must be a separate word: "ես" matches, "կնկարես" / "esor" do not.
+# Also accepts the Armenian question/emphasis mark inside it: "ե՞ս", "ե՛ս".
+SELF_USER_ID = 866680974
+SELF_RE = re.compile(r"(?<!\w)(es|ե[՞՛՜]?ս)(?!\w)", re.IGNORECASE)
 
 # summon words / bot tag -> acknowledge
 SUMMON_RE = re.compile(r"(berimor|բերիմոր|բերիմոռ|բեռիմոր|բեռիմոռ|@berimor_kre_shift_bot)", re.IGNORECASE)
@@ -89,11 +95,16 @@ INSULT_REPLIES = [
     "հին և ծեր բերիմոր",
 ]
 
+# Rare replies: 1 in 100 summons / insults get these instead of the lists above
+RARE_CHANCE = 0.01
+SUMMON_RARE_REPLY = "ինչա արա"
+INSULT_RARE_REPLY = "լավ խելոք մնա հլը"
+
 # Armenian weekdays -> Python weekday() (Mon=0 … Sun=6)
 WEEKDAYS = {
     "erkushabti": 0, "երկուշաբթի": 0,
     "ereqshabti": 1, "երեքշաբթի": 1,
-    "chorekshabti": 2, "չորեքշաբթի": 2,
+    "choreqshabti": 2, "չորեքշաբթի": 2,
     "hingshabti": 3, "հինգշաբթի": 3,
     "urbat": 4, "ուրբաթ": 4,
     "shabat": 5, "շաբաթ": 5,
@@ -172,21 +183,22 @@ def resolve_date(text: str, today: date):
 
     return None  # nothing found
 
-def render(s: str, label: str, d: date, mode: str) -> str:
+def render(s: str, label: str, d: date, mode: str, self_user: bool = False) -> str:
+    # self_user: SELF_USER_ID is asking about themselves -> "you" wording (ես)
     ds = d.strftime("%d.%m.%Y")
     if mode == "free":
         if s == OFF:
-            return "հա ազատ ա ցավդ տանեմ"
-        return "չէ զբաղված ա ախպերս"
+            return "հա ազատ ես ցավդ տանեմ" if self_user else "հա ազատ ա ցավդ տանեմ"
+        return "չէ զբաղված ես ախպերս, ներող" if self_user else "չէ զբաղված ա ախպերս"
     # work mode
     if s == DAY:
         return "հա ցավդ տանեմ, ցերեկվա սմեն"
     if s == NIGHT:
         return "հա ընգերս, գիշերային պախատ"
-    return "չէ բռատս, ազատ ա"
+    return "չէ բռատս, ազատ ես, գուլյատ արա" if self_user else "չէ բռատս, ազատ ա"
 
-def answer(target: date, label: str, mode: str) -> str:
-    return render(shift_for(target), label, target, mode)
+def answer(target: date, label: str, mode: str, self_user: bool = False) -> str:
+    return render(shift_for(target), label, target, mode, self_user)
 
 def quote_params(message, pattern):
     """Build ReplyParameters that quote the exact keyword `pattern` matched in `message.text`."""
@@ -358,7 +370,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(TZ).date()
 
     # A real question needs a name + (a work word OR the free word "azat").
-    has_name = bool(NAME_RE.search(text))
+    # SELF_USER_ID may also use a "self" word (es / ես) instead of the name.
+    user = update.effective_user
+    is_self_user = bool(user and user.id == SELF_USER_ID)
+    has_name = bool(NAME_RE.search(text)) or (is_self_user and bool(SELF_RE.search(text)))
     has_azat = bool(AZAT_RE.search(text))
     has_work = bool(WORK_RE.search(text))
     is_question = has_name and (has_work or has_azat)
@@ -371,13 +386,15 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # no date given: ask "when?" and start waiting (remember the mode)
             context.chat_data["awaiting_since"] = datetime.now(TZ)
             context.chat_data["awaiting_mode"] = mode
+            context.chat_data["awaiting_self"] = is_self_user
             await update.message.reply_text("ե՞րբ ցավդ տանեմ")
             return
         # date given: answer and stop waiting
         context.chat_data.pop("awaiting_since", None)
         context.chat_data.pop("awaiting_mode", None)
+        context.chat_data.pop("awaiting_self", None)
         target, label = result
-        await update.message.reply_text(answer(target, label, mode))
+        await update.message.reply_text(answer(target, label, mode, is_self_user))
         return
 
     # not a full question: maybe it's the answer to a previous "erb?"
@@ -386,15 +403,22 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = resolve_date(text, today)
         if result is not None:
             saved_mode = context.chat_data.get("awaiting_mode", "work")
+            # use the wording for whoever asked the original question
+            saved_self = context.chat_data.get("awaiting_self", False)
             context.chat_data.pop("awaiting_since", None)
             context.chat_data.pop("awaiting_mode", None)
+            context.chat_data.pop("awaiting_self", None)
             target, label = result
-            await update.message.reply_text(answer(target, label, saved_mode))
+            await update.message.reply_text(answer(target, label, saved_mode, saved_self))
             return
 
-    # insult -> reply, quoting the exact keyword that triggered it (1/7 each)
+    # insult -> reply, quoting the exact keyword that triggered it
+    # (1/100 rare reply, otherwise 1/7 each)
     if INSULT_RE.search(text):
-        reply = random.choice(INSULT_REPLIES)
+        if random.random() < RARE_CHANCE:
+            reply = INSULT_RARE_REPLY
+        else:
+            reply = random.choice(INSULT_REPLIES)
         rp = quote_params(update.message, INSULT_RE)
         try:
             await update.message.reply_text(reply, reply_parameters=rp)
@@ -403,9 +427,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply)
         return
 
-    # summon (word or @tag) -> random acknowledgement (1/3 each)
+    # summon (word or @tag) -> random acknowledgement
+    # (1/100 rare reply, otherwise 1/3 each)
     if SUMMON_RE.search(text):
-        await update.message.reply_text(random.choice(SUMMON_REPLIES))
+        if random.random() < RARE_CHANCE:
+            await update.message.reply_text(SUMMON_RARE_REPLY)
+        else:
+            await update.message.reply_text(random.choice(SUMMON_REPLIES))
         return
 
 def main():
