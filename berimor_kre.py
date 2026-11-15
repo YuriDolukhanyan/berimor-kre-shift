@@ -95,6 +95,15 @@ INSULT_REPLIES = [
     "հին և ծեր բերիմոր",
 ]
 
+# cinema words -> reply "kinaciatr"
+# prefix match, so "kinoyi", "filmy", "tatronum", "կինոյի", "թատրոնում" also trigger
+KINO_RE = re.compile(
+    r"\b(kino|kinotatron|kinaciatr|film|movie|theatre|theater|tatron|"
+    r"կինո|կինոթատրոն|կինացիատր|ֆիլմ|մուվի|թատրոն)",
+    re.IGNORECASE,
+)
+KINO_REPLY = "kinaciatr"
+
 # Rare replies: 1 in 100 summons / insults get these instead of the lists above
 RARE_CHANCE = 0.01
 SUMMON_RARE_REPLY = "ինչա արա"
@@ -412,9 +421,20 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(answer(target, label, saved_mode, saved_self))
             return
 
+    # cinema words -> "kinaciatr", quoting the exact keyword that triggered it
+    if KINO_RE.search(text):
+        rp = quote_params(update.message, KINO_RE)
+        try:
+            await update.message.reply_text(KINO_REPLY, reply_parameters=rp)
+        except Exception:
+            await update.message.reply_text(KINO_REPLY)
+        return
+
     # insult -> reply, quoting the exact keyword that triggered it
     # (1/100 rare reply, otherwise 1/7 each)
-    if INSULT_RE.search(text):
+    # Only when the insult is aimed at the bot: the message must ALSO contain
+    # a berimor word / @tag (SUMMON_RE). A bare insult in normal chat is ignored.
+    if INSULT_RE.search(text) and SUMMON_RE.search(text):
         if random.random() < RARE_CHANCE:
             reply = INSULT_RARE_REPLY
         else:
