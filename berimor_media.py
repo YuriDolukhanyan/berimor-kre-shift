@@ -34,6 +34,9 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+import logging
+
+log = logging.getLogger("berimor.media")
 
 
 class MediaError(Exception):
@@ -59,6 +62,11 @@ FORMAT_SELECTOR = (
     "/b[height<=1080][ext=mp4]"
     "/b[height<=1080]"
 )
+
+# The full-video fallback is skipped for videos longer than this (seconds).
+# Downloading a long video just to cut a few seconds takes too long and
+# blocks other /clip requests. Override with FALLBACK_MAX_SEC.
+FALLBACK_MAX_SEC = int(os.environ.get("FALLBACK_MAX_SEC", "3600"))
 
 # YouTube player client that serves 1080p with a PO token from a server IP.
 PLAYER_CLIENTS = ["mweb"]
@@ -189,31 +197,48 @@ def build_audio_filter(duration: int, fade: float) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: yt-dlp downloads the exact section to a local file
+# Stage 1: yt-dlp downloads the media to a local file
 # ---------------------------------------------------------------------------
-def _ytdlp_download_section(url: str, start: int, end: int, cookies_file: Path | None,
-                            work_dir: Path) -> tuple[Path, dict]:
+def _explain(stderr: str) -> str:
+    """Pick the lines of yt-dlp/ffmpeg output that say WHY it failed."""
+    lines = [l for l in (stderr or "").strip().splitlines() if l.strip()]
+    keys = ("error", "403", "429", "forbidden", "sign in", "bot", "unavailable",
+            "private", "http", "timed out", "not available")
+    hits = [l for l in lines if any(k in l.lower() for k in keys)]
+    picked = (hits or lines)[-6:]
+    return "\n".join(l[:300] for l in picked) or "unknown error"
+
+
+def _ytdlp_download(url: str, cookies_file: Path | None, work_dir: Path,
+                    start: int | None = None, end: int | None = None) -> tuple[Path, dict]:
     """
-    Download [start, end) with yt-dlp into work_dir. Returns (media_path, info).
-    yt-dlp handles the correct headers/PO-token, so no 403.
+    Download with yt-dlp into work_dir. Returns (media_path, info).
+    With start/end: only that section (fast, uses yt-dlp's ffmpeg downloader).
+    Without: the whole video via yt-dlp's native downloader (slower, but it
+    sends the correct headers/PO token itself, so it survives cases where the
+    section download fails).
     """
     ytdlp = _ytdlp_bin()
     out_tmpl = str(work_dir / "src.%(ext)s")
-    section = f"*{hhmmss(start)}-{hhmmss(end)}"
 
     cmd = [
         ytdlp,
-        "--no-warnings",
         "-f", FORMAT_SELECTOR,
         "--extractor-args", "youtube:player_client=" + ",".join(PLAYER_CLIENTS),
         "--remote-components", "ejs:github",
         "--merge-output-format", "mp4",
-        "--download-sections", section,
-        "--force-keyframes-at-cuts",
         "-o", out_tmpl,
         "--print-json",
         "--no-simulate",
+        "--no-progress",
     ]
+    if start is not None and end is not None:
+        cmd += ["--download-sections", f"*{hhmmss(start)}-{hhmmss(end)}",
+                "--force-keyframes-at-cuts"]
+    else:
+        # full download: yt-dlp skips (without downloading) anything longer
+        # than FALLBACK_MAX_SEC, and anything with unknown length (live streams)
+        cmd += ["--match-filter", f"duration <= {FALLBACK_MAX_SEC}"]
     deno = _deno_path()
     if deno:
         cmd += ["--js-runtimes", f"deno:{deno}"]
@@ -221,16 +246,19 @@ def _ytdlp_download_section(url: str, start: int, end: int, cookies_file: Path |
         cmd += ["--cookies", str(cookies_file)]
     cmd += [url]
 
+    mode = "section" if start is not None else "full"
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              errors="replace", timeout=900)
     except subprocess.TimeoutExpired as e:
-        raise MediaError("Timed out while downloading the clip from YouTube.") from e
+        raise MediaError("Timed out while downloading from YouTube.") from e
 
     if proc.returncode != 0:
-        tail = "\n".join((proc.stderr or "").strip().splitlines()[-8:]) or "unknown error"
-        raise MediaError(f"yt-dlp could not download the clip:\n{tail}")
+        # full output goes to the server log (journalctl -u berimor)
+        log.warning("yt-dlp %s download failed (exit %s) for %s\n--- stderr ---\n%s",
+                    mode, proc.returncode, url, proc.stderr)
+        raise MediaError(f"yt-dlp could not download the clip ({mode}):\n{_explain(proc.stderr)}")
 
-    # Parse the JSON yt-dlp printed (for title/id/dimensions).
     info: dict = {}
     import json
     for line in (proc.stdout or "").splitlines():
@@ -242,9 +270,15 @@ def _ytdlp_download_section(url: str, start: int, end: int, cookies_file: Path |
             except json.JSONDecodeError:
                 continue
 
-    # Find the produced file (mp4 preferred).
-    produced = sorted(work_dir.glob("src.*"))
-    produced = [p for p in produced if p.suffix.lower() != ".json"]
+    produced = [p for p in sorted(work_dir.glob("src.*"))
+                if p.suffix.lower() not in (".json", ".part", ".ytdl")]
+    if not produced and mode == "full":
+        # yt-dlp exited OK but downloaded nothing -> --match-filter skipped it
+        # (we don't match on its message text: --print-json makes it quiet)
+        log.warning("full download skipped by length filter for %s", url)
+        raise MediaError(
+            f"skipped, the video is longer than {FALLBACK_MAX_SEC // 60} minutes "
+            f"(or its length is unknown). Try the same /clip again in a few minutes.")
     if not produced:
         raise MediaError("yt-dlp finished but produced no file.")
     media = next((p for p in produced if p.suffix.lower() == ".mp4"), produced[0])
@@ -254,11 +288,16 @@ def _ytdlp_download_section(url: str, start: int, end: int, cookies_file: Path |
 # ---------------------------------------------------------------------------
 # Stage 2: ffmpeg re-encodes the LOCAL file (canvas + fade + H.264/AAC)
 # ---------------------------------------------------------------------------
-def _encode_local(ffmpeg: Path, src: Path, duration: int, fade: float, dst: Path) -> None:
+def _encode_local(ffmpeg: Path, src: Path, duration: int, fade: float, dst: Path,
+                  offset: int = 0) -> None:
+    """offset > 0: src is the FULL video, so cut [offset, offset+duration) here."""
     preset = os.environ.get("X264_PRESET", "medium")
     crf    = os.environ.get("X264_CRF", "18")
 
-    cmd = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    cmd = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y"]
+    if offset:
+        cmd += ["-ss", str(offset)]
+    cmd += ["-i", str(src), "-t", str(duration)]
     cmd += ["-vf", build_video_filter(duration, fade)]
     af = build_audio_filter(duration, fade)
     if af:
@@ -274,6 +313,7 @@ def _encode_local(ffmpeg: Path, src: Path, duration: int, fade: float, dst: Path
     proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-10:]) or "(no output)"
+        log.warning("ffmpeg encode failed (exit %s)\n%s", proc.returncode, proc.stderr)
         raise MediaError(f"ffmpeg encode failed (exit {proc.returncode}):\n{tail}")
 
 
@@ -295,7 +335,23 @@ def download_clip(url: str, start_sec: int, end_sec: int, out_dir: str | os.Path
 
     with tempfile.TemporaryDirectory(prefix="berimor_dl_") as td:
         work = Path(td)
-        src, info = _ytdlp_download_section(url, start_sec, end_sec, cookies, work)
+        offset = 0
+        try:
+            sec_dir = work / "section"
+            sec_dir.mkdir()
+            src, info = _ytdlp_download(url, cookies, sec_dir, start_sec, end_sec)
+        except MediaError as first:
+            # Section download failed (often "ffmpeg exited with code 8" =
+            # YouTube refused ffmpeg's request). Fall back to downloading the
+            # whole video with yt-dlp's own downloader and cutting it locally.
+            log.warning("section download failed, trying full download: %s", first)
+            full_dir = work / "full"
+            full_dir.mkdir()
+            try:
+                src, info = _ytdlp_download(url, cookies, full_dir)
+            except MediaError as second:
+                raise MediaError(f"{first}\n\nFull-video fallback also failed:\n{second}") from second
+            offset = start_sec
 
         title    = safe_stem(info.get("title", "clip"))
         video_id = info.get("id", "video")
@@ -303,7 +359,7 @@ def download_clip(url: str, start_sec: int, end_sec: int, out_dir: str | os.Path
         h        = info.get("height")
         mp4_path = out_dir / f"{title} [{video_id}] {mmss(start_sec)}-{mmss(end_sec)}.mp4"
 
-        _encode_local(ffmpeg, src, duration, fade, mp4_path)
+        _encode_local(ffmpeg, src, duration, fade, mp4_path, offset=offset)
 
     if not mp4_path.exists() or mp4_path.stat().st_size == 0:
         raise MediaError("The clip file was not produced (empty output).")
