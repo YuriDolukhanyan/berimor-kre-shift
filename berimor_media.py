@@ -32,6 +32,7 @@ import sys
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 import logging
@@ -69,7 +70,28 @@ FORMAT_SELECTOR = (
 FALLBACK_MAX_SEC = int(os.environ.get("FALLBACK_MAX_SEC", "3600"))
 
 # YouTube player client that serves 1080p with a PO token from a server IP.
-PLAYER_CLIENTS = ["mweb"]
+
+# YouTube refuses some requests from server IPs at random (HTTP 403), and a
+# retry with another client or without cookies often works. The bot tries
+# these in order, first as a fast section download, then as a full download.
+# "+cookies" = send cookies.txt. Override with YT_ATTEMPTS, e.g.
+#   YT_ATTEMPTS="mweb+cookies,mweb,web_safari+cookies"
+# tv is last because it sometimes only offers 360p.
+_DEFAULT_ATTEMPTS = "mweb+cookies,mweb,web_safari+cookies,tv+cookies"
+
+
+def _attempts() -> list[tuple[str, bool]]:
+    out = []
+    for item in os.environ.get("YT_ATTEMPTS", _DEFAULT_ATTEMPTS).split(","):
+        item = item.strip()
+        if item:
+            client, _, flag = item.partition("+")
+            out.append((client.strip(), flag.strip() == "cookies"))
+    return out or [("mweb", True)]
+
+
+def _attempt_name(client: str, use_cookies: bool) -> str:
+    return client + (" + cookies" if use_cookies else "")
 
 
 @dataclass
@@ -210,7 +232,8 @@ def _explain(stderr: str) -> str:
 
 
 def _ytdlp_download(url: str, cookies_file: Path | None, work_dir: Path,
-                    start: int | None = None, end: int | None = None) -> tuple[Path, dict]:
+                    start: int | None = None, end: int | None = None,
+                    client: str = "mweb") -> tuple[Path, dict]:
     """
     Download with yt-dlp into work_dir. Returns (media_path, info).
     With start/end: only that section (fast, uses yt-dlp's ffmpeg downloader).
@@ -224,7 +247,7 @@ def _ytdlp_download(url: str, cookies_file: Path | None, work_dir: Path,
     cmd = [
         ytdlp,
         "-f", FORMAT_SELECTOR,
-        "--extractor-args", "youtube:player_client=" + ",".join(PLAYER_CLIENTS),
+        "--extractor-args", f"youtube:player_client={client}",
         "--remote-components", "ejs:github",
         "--merge-output-format", "mp4",
         "-o", out_tmpl,
@@ -320,6 +343,45 @@ def _encode_local(ffmpeg: Path, src: Path, duration: int, fade: float, dst: Path
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+def _download_with_retries(url: str, start_sec: int, end_sec: int,
+                           cookies: Path | None, work: Path) -> tuple[Path, dict, int]:
+    """
+    Try every attempt (client / cookies) as a section download, then as a
+    full download. Returns (src, info, offset); offset > 0 means src is the
+    whole video and the clip still has to be cut out of it.
+    """
+    attempts = [(c, ck) for c, ck in _attempts() if not (ck and cookies is None)] \
+        or [("mweb", False)]
+    errors: list[str] = []
+
+    for mode in ("section", "full"):
+        for n, (client, use_cookies) in enumerate(attempts, 1):
+            name = _attempt_name(client, use_cookies)
+            d = work / f"{mode}_{n}"
+            d.mkdir()
+            try:
+                if mode == "section":
+                    src, info = _ytdlp_download(url, cookies if use_cookies else None,
+                                                d, start_sec, end_sec, client=client)
+                    offset = 0
+                else:
+                    src, info = _ytdlp_download(url, cookies if use_cookies else None,
+                                                d, client=client)
+                    offset = start_sec
+                log.info("download OK: %s, %s (after %d failed tries)",
+                         mode, name, len(errors))
+                return src, info, offset
+            except MediaError as e:
+                log.warning("download failed: %s, %s: %s", mode, name, e)
+                errors.append(f"[{mode}, {name}] {str(e).splitlines()[-1]}")
+                if "longer than" in str(e):
+                    break  # full download skipped for long videos: same for every client
+                time.sleep(2)
+
+    raise MediaError("YouTube refused every attempt:\n" + "\n".join(errors[-6:]) +
+                     "\n\nThis is usually temporary; try again in a few minutes.")
+
+
 def download_clip(url: str, start_sec: int, end_sec: int, out_dir: str | os.PathLike,
                   *, fade: float = DEFAULT_FADE_SEC,
                   cookies_file: str | os.PathLike | None = None,
@@ -335,23 +397,7 @@ def download_clip(url: str, start_sec: int, end_sec: int, out_dir: str | os.Path
 
     with tempfile.TemporaryDirectory(prefix="berimor_dl_") as td:
         work = Path(td)
-        offset = 0
-        try:
-            sec_dir = work / "section"
-            sec_dir.mkdir()
-            src, info = _ytdlp_download(url, cookies, sec_dir, start_sec, end_sec)
-        except MediaError as first:
-            # Section download failed (often "ffmpeg exited with code 8" =
-            # YouTube refused ffmpeg's request). Fall back to downloading the
-            # whole video with yt-dlp's own downloader and cutting it locally.
-            log.warning("section download failed, trying full download: %s", first)
-            full_dir = work / "full"
-            full_dir.mkdir()
-            try:
-                src, info = _ytdlp_download(url, cookies, full_dir)
-            except MediaError as second:
-                raise MediaError(f"{first}\n\nFull-video fallback also failed:\n{second}") from second
-            offset = start_sec
+        src, info, offset = _download_with_retries(url, start_sec, end_sec, cookies, work)
 
         title    = safe_stem(info.get("title", "clip"))
         video_id = info.get("id", "video")
