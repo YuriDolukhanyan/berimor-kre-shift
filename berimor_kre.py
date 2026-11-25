@@ -229,15 +229,29 @@ def quote_params(message, pattern):
 # ===========================================================================
 CLIP_USAGE = (
     "🎬 *Clip downloader*\n\n"
-    "Send:\n"
-    "`/clip <youtube-url> <start> <end> [fade]`\n\n"
-    "Times can be `M:SS`, `H:MM:SS`, or plain seconds.\n\n"
+    "`/clip <url> <start> <end> [fade] [audio|video|both] [name]`\n\n"
+    "• *start / end*: `M:SS`, `H:MM:SS` or seconds\n"
+    "• *fade*: seconds of fade in/out, default " + f"{DEFAULT_FADE_SEC:g}" + "\n"
+    "• *audio* = MP3 only (fastest), *video* = MP4 only, "
+    "*both* = MP4 + MP3 (default)\n"
+    "• *name*: file name for the result (spaces allowed), "
+    "default is the video title\n\n"
     "Examples:\n"
     "`/clip https://youtu.be/LYU-8IFcDPw 0:31 0:51`\n"
-    "`/clip https://youtu.be/LYU-8IFcDPw 0:31 0:51 1`   (1s fade)\n\n"
-    "Old 4-number style also works:\n"
-    "`/clip <url> 0 31 0 51`   (start_min start_sec end_min end_sec)"
+    "`/clip https://youtu.be/LYU-8IFcDPw 0:31 0:51 audio`\n"
+    "`/clip https://youtu.be/LYU-8IFcDPw 0:31 0:51 video Faint intro`\n"
+    "`/clip https://youtu.be/LYU-8IFcDPw 0:31 0:51 1 audio Faint intro`\n\n"
+    "Old style also works: `/clip <url> 0 31 0 51 ...`"
 )
+
+# words accepted for the output type (any case)
+MODE_WORDS = {
+    "audio": "audio", "mp3": "audio", "a": "audio", "sound": "audio", "աուդիո": "audio",
+    "video": "video", "mp4": "video", "v": "video", "վիդեո": "video",
+    "both": "both", "all": "both", "երկուսը": "both",
+}
+
+MODE_LABEL = {"audio": "MP3", "video": "MP4", "both": "MP4 + MP3"}
 
 
 def parse_timecode(token: str) -> int:
@@ -257,37 +271,80 @@ def parse_timecode(token: str) -> int:
     return h * 3600 + m * 60 + s
 
 
-def parse_clip_args(args: list[str]) -> tuple[str, int, int, float]:
+def _is_number(token: str) -> bool:
+    return bool(re.fullmatch(r"\d+(\.\d+)?", token))
+
+
+def parse_clip_args(args: list[str]) -> tuple[str, int, int, float, str, str | None]:
     """
-    Accepts, after the /clip command:
-        <url> <start> <end> [fade]                (timecode style)
-        <url> <s_min> <s_sec> <e_min> <e_sec> [fade]   (old 4-number style)
-    Returns (url, start_sec, end_sec, fade). Raises ValueError with a message.
+    After /clip:
+        <url> <start> <end> [fade] [audio|video|both] [name ...]
+        <url> <s_min> <s_sec> <e_min> <e_sec> [fade] [mode] [name ...]   (old style)
+    fade and mode may come in either order; everything after them is the name.
+    Returns (url, start_sec, end_sec, fade, mode, name). Raises ValueError.
     """
     if len(args) < 3:
         raise ValueError("Not enough arguments.")
     url = args[0]
     rest = args[1:]
 
-    if len(rest) in (2, 3):            # timecode style
+    # old 4-number style: four plain integers, seconds 0..59
+    if (len(rest) >= 4 and all(re.fullmatch(r"\d+", t) for t in rest[:4])
+            and int(rest[1]) < 60 and int(rest[3]) < 60):
+        start = int(rest[0]) * 60 + int(rest[1])
+        end = int(rest[2]) * 60 + int(rest[3])
+        extra = rest[4:]
+    else:
         start = parse_timecode(rest[0])
         end = parse_timecode(rest[1])
-        fade = float(rest[2]) if len(rest) == 3 else DEFAULT_FADE_SEC
-    elif len(rest) in (4, 5):          # old 4-number style
-        s_min, s_sec, e_min, e_sec = (int(rest[0]), int(rest[1]), int(rest[2]), int(rest[3]))
-        if not (0 <= s_sec < 60 and 0 <= e_sec < 60):
-            raise ValueError("seconds must be 0..59")
-        start = s_min * 60 + s_sec
-        end = e_min * 60 + e_sec
-        fade = float(rest[4]) if len(rest) == 5 else DEFAULT_FADE_SEC
-    else:
-        raise ValueError("Wrong number of arguments.")
+        extra = rest[2:]
 
-    if fade < 0:
-        raise ValueError("fade must be >= 0")
+    fade: float | None = None
+    mode: str | None = None
+    while extra:
+        tok = extra[0]
+        if fade is None and _is_number(tok):
+            fade = float(tok)
+        elif mode is None and tok.lower() in MODE_WORDS:
+            mode = MODE_WORDS[tok.lower()]
+        else:
+            break
+        extra = extra[1:]
+    name = " ".join(extra).strip() or None
+
+    if fade is None:
+        fade = DEFAULT_FADE_SEC
+    if fade > 30:
+        raise ValueError(f"fade {fade:g}s is too long (max 30s)")
     if end <= start:
         raise ValueError("End time must be after start time.")
-    return url, start, end, fade
+    return url, start, end, fade, mode or "both", name
+
+
+async def _send_video(update: Update, path: Path, caption: str) -> bool:
+    """Send the MP4 if it fits Telegram's bot limit. Returns True if sent."""
+    size_mb = path.stat().st_size / (1024 * 1024)
+    if size_mb > TELEGRAM_MAX_MB:
+        await update.message.reply_text(
+            f"⚠️ The MP4 is {size_mb:.0f} MB, above Telegram's {TELEGRAM_MAX_MB} MB "
+            "bot limit, so I can't send it. Try a shorter range, or `audio`.",
+            parse_mode="Markdown",
+        )
+        return False
+    with open(path, "rb") as fh:
+        await update.message.reply_document(
+            document=fh, filename=path.name, caption=f"🎬 {caption}",
+            read_timeout=600, write_timeout=600, connect_timeout=60,
+        )
+    return True
+
+
+async def _send_audio(update: Update, path: Path, title: str) -> None:
+    with open(path, "rb") as fh:
+        await update.message.reply_audio(
+            audio=fh, filename=path.name, title=title,
+            read_timeout=600, write_timeout=600, connect_timeout=60,
+        )
 
 
 async def clip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -295,64 +352,58 @@ async def clip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        url, start, end, fade = parse_clip_args(context.args)
+        url, start, end, fade, mode, name = parse_clip_args(context.args)
     except ValueError as e:
         await update.message.reply_text(
             f"⚠️ {e}\n\n{CLIP_USAGE}", parse_mode="Markdown"
         )
         return
 
-    status = await update.message.reply_text("⏳ Resolving the video…")
+    length = end - start
+    status = await update.message.reply_text(
+        f"⏳ {MODE_LABEL[mode]} · {length}s clip"
+        + (f" · \"{name}\"" if name else "")
+        + " · resolving the video…"
+    )
     workdir = Path(tempfile.mkdtemp(prefix="berimor_clip_"))
 
     async with JOB_SEMAPHORE:
         try:
-            # 1) Download + cut + fade + normalize to 1080p (blocking -> thread)
-            await status.edit_text("⬇️ Downloading & encoding 1080p… this can take a bit.")
+            # 1) Download + cut (+ encode). Blocking work runs in a thread.
+            if mode == "audio":
+                await status.edit_text("🎧 Downloading the audio and making the MP3…")
+            else:
+                await status.edit_text("⬇️ Downloading & encoding 1080p video… this can take a bit.")
             result = await asyncio.to_thread(
-                download_clip, url, start, end, workdir, fade=fade
+                download_clip, url, start, end, workdir,
+                fade=fade, mode=mode, name=name,
             )
+            label = name or result.title
 
-            # Warn if YouTube only served a sub-1080p source (usually needs PO token)
+            if mode == "audio":
+                await status.edit_text("📤 Uploading the MP3…")
+                await _send_audio(update, result.mp3_path, label)
+                await status.delete()
+                return
+
+            # Warn if YouTube only served a sub-1080p source
             if result.height and result.height < 1080:
                 await update.message.reply_text(
                     f"ℹ️ YouTube only served {result.width}x{result.height} for this "
-                    "video (likely needs a PO token / cookies on the server), so the "
-                    "MP4 is padded to 1080p rather than truly 1080p."
+                    "video, so the MP4 is padded to 1080p rather than truly 1080p."
                 )
 
-            # 2) Convert to MP3 (blocking -> thread)
-            await status.edit_text("🎧 Converting to MP3…")
-            mp3_path = await asyncio.to_thread(convert_to_mp3, result.mp4_path)
+            # 2) MP3 from the finished MP4 (only for "both")
+            mp3_path = None
+            if mode == "both":
+                await status.edit_text("🎧 Converting to MP3…")
+                mp3_path = await asyncio.to_thread(convert_to_mp3, result.mp4_path)
 
-            # 3) Send both files back
-            await status.edit_text("📤 Uploading files…")
-            mp4_mb = result.mp4_path.stat().st_size / (1024 * 1024)
-
-            # ---- MP4 ----
-            if mp4_mb > TELEGRAM_MAX_MB:
-                await update.message.reply_text(
-                    f"⚠️ The MP4 is {mp4_mb:.0f} MB, above Telegram's "
-                    f"{TELEGRAM_MAX_MB} MB bot limit, so I can't send it here. "
-                    "Try a shorter range. Sending the MP3 only."
-                )
-            else:
-                with open(result.mp4_path, "rb") as fh:
-                    await update.message.reply_document(
-                        document=fh,
-                        filename=result.mp4_path.name,
-                        caption=f"🎬 {result.title}",
-                        read_timeout=600, write_timeout=600, connect_timeout=60,
-                    )
-
-            # ---- MP3 ----
-            with open(mp3_path, "rb") as fh:
-                await update.message.reply_audio(
-                    audio=fh,
-                    filename=mp3_path.name,
-                    title=result.title,
-                    read_timeout=600, write_timeout=600, connect_timeout=60,
-                )
+            # 3) Upload what was asked for
+            await status.edit_text("📤 Uploading…")
+            await _send_video(update, result.mp4_path, label)
+            if mp3_path:
+                await _send_audio(update, mp3_path, label)
 
             await status.delete()
 
