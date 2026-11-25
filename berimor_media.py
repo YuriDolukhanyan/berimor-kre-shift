@@ -64,6 +64,11 @@ FORMAT_SELECTOR = (
     "/b[height<=1080]"
 )
 
+# "audio" mode downloads only the audio stream: much smaller than the video.
+AUDIO_FORMAT_SELECTOR = "ba[acodec^=mp4a]/ba/b"
+
+MODES = ("both", "video", "audio")
+
 # The full-video fallback is skipped for videos longer than this (seconds).
 # Downloading a long video just to cut a few seconds takes too long and
 # blocks other /clip requests. Override with FALLBACK_MAX_SEC.
@@ -96,11 +101,12 @@ def _attempt_name(client: str, use_cookies: bool) -> str:
 
 @dataclass
 class ClipResult:
-    mp4_path: Path
+    mp4_path: Path | None          # None in "audio" mode
     width: int | None
     height: int | None
     title: str
     video_id: str
+    mp3_path: Path | None = None   # set in "audio" mode (made directly, no MP4)
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +239,8 @@ def _explain(stderr: str) -> str:
 
 def _ytdlp_download(url: str, cookies_file: Path | None, work_dir: Path,
                     start: int | None = None, end: int | None = None,
-                    client: str = "mweb") -> tuple[Path, dict]:
+                    client: str = "mweb",
+                    fmt: str = FORMAT_SELECTOR) -> tuple[Path, dict]:
     """
     Download with yt-dlp into work_dir. Returns (media_path, info).
     With start/end: only that section (fast, uses yt-dlp's ffmpeg downloader).
@@ -246,7 +253,7 @@ def _ytdlp_download(url: str, cookies_file: Path | None, work_dir: Path,
 
     cmd = [
         ytdlp,
-        "-f", FORMAT_SELECTOR,
+        "-f", fmt,
         "--extractor-args", f"youtube:player_client={client}",
         "--remote-components", "ejs:github",
         "--merge-output-format", "mp4",
@@ -340,11 +347,42 @@ def _encode_local(ffmpeg: Path, src: Path, duration: int, fade: float, dst: Path
         raise MediaError(f"ffmpeg encode failed (exit {proc.returncode}):\n{tail}")
 
 
+def _encode_audio_local(ffmpeg: Path, src: Path, duration: int, fade: float, dst: Path,
+                        offset: int = 0, bitrate: str = AUDIO_BITRATE) -> None:
+    """Cut + fade the LOCAL file straight to MP3 (no video encode)."""
+    cmd = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y"]
+    if offset:
+        cmd += ["-ss", str(offset)]
+    cmd += ["-i", str(src), "-t", str(duration), "-vn"]
+    af = build_audio_filter(duration, fade)
+    if af:
+        cmd += ["-af", af]
+    cmd += ["-codec:a", "libmp3lame", "-b:a", bitrate, str(dst)]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or "").strip().splitlines()[-10:]) or "(no output)"
+        log.warning("ffmpeg audio encode failed (exit %s)\n%s", proc.returncode, proc.stderr)
+        raise MediaError(f"ffmpeg audio encode failed (exit {proc.returncode}):\n{tail}")
+
+
+def clean_name(name: str | None) -> str | None:
+    """User-given file name -> safe file stem (no extension). None/empty -> None."""
+    if not name:
+        return None
+    name = name.strip().strip('"\'“”«»').strip()
+    name = re.sub(r"\.(mp4|mp3|m4a|wav|mov)$", "", name, flags=re.IGNORECASE)
+    if not re.search(r"\w", name):
+        return None  # nothing usable left (e.g. only symbols)
+    return safe_stem(name, limit=100)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 def _download_with_retries(url: str, start_sec: int, end_sec: int,
-                           cookies: Path | None, work: Path) -> tuple[Path, dict, int]:
+                           cookies: Path | None, work: Path,
+                           fmt: str = FORMAT_SELECTOR) -> tuple[Path, dict, int]:
     """
     Try every attempt (client / cookies) as a section download, then as a
     full download. Returns (src, info, offset); offset > 0 means src is the
@@ -362,11 +400,12 @@ def _download_with_retries(url: str, start_sec: int, end_sec: int,
             try:
                 if mode == "section":
                     src, info = _ytdlp_download(url, cookies if use_cookies else None,
-                                                d, start_sec, end_sec, client=client)
+                                                d, start_sec, end_sec, client=client,
+                                                fmt=fmt)
                     offset = 0
                 else:
                     src, info = _ytdlp_download(url, cookies if use_cookies else None,
-                                                d, client=client)
+                                                d, client=client, fmt=fmt)
                     offset = start_sec
                 log.info("download OK: %s, %s (after %d failed tries)",
                          mode, name, len(errors))
@@ -384,27 +423,49 @@ def _download_with_retries(url: str, start_sec: int, end_sec: int,
 
 def download_clip(url: str, start_sec: int, end_sec: int, out_dir: str | os.PathLike,
                   *, fade: float = DEFAULT_FADE_SEC,
+                  mode: str = "both",
+                  name: str | None = None,
                   cookies_file: str | os.PathLike | None = None,
                   ffmpeg_path: str | os.PathLike | None = None) -> ClipResult:
+    """
+    mode "both"/"video": returns an MP4 (1920x1080, H.264/AAC, fades) in
+        result.mp4_path. For "both", call convert_to_mp3() on it afterwards.
+    mode "audio": downloads only the audio stream and returns an MP3 (with
+        fades) in result.mp3_path; no video is downloaded or encoded.
+    name: output file name without extension. None -> "<title> [<id>] <times>".
+    """
     if end_sec <= start_sec:
         raise MediaError("End time must be after start time.")
+    if mode not in MODES:
+        raise MediaError(f"Unknown mode '{mode}' (use: {', '.join(MODES)}).")
 
     ffmpeg   = find_ffmpeg(ffmpeg_path)
     cookies  = resolve_cookies(cookies_file)
     out_dir  = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     duration = end_sec - start_sec
+    audio    = mode == "audio"
 
     with tempfile.TemporaryDirectory(prefix="berimor_dl_") as td:
         work = Path(td)
-        src, info, offset = _download_with_retries(url, start_sec, end_sec, cookies, work)
+        src, info, offset = _download_with_retries(
+            url, start_sec, end_sec, cookies, work,
+            fmt=AUDIO_FORMAT_SELECTOR if audio else FORMAT_SELECTOR)
 
         title    = safe_stem(info.get("title", "clip"))
         video_id = info.get("id", "video")
-        w        = info.get("width")
-        h        = info.get("height")
-        mp4_path = out_dir / f"{title} [{video_id}] {mmss(start_sec)}-{mmss(end_sec)}.mp4"
+        stem     = clean_name(name) or f"{title} [{video_id}] {mmss(start_sec)}-{mmss(end_sec)}"
 
+        if audio:
+            mp3_path = out_dir / f"{stem}.mp3"
+            _encode_audio_local(ffmpeg, src, duration, fade, mp3_path, offset=offset)
+            if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+                raise MediaError("The MP3 file was not produced (empty output).")
+            return ClipResult(None, None, None, title, video_id, mp3_path=mp3_path)
+
+        w = info.get("width")
+        h = info.get("height")
+        mp4_path = out_dir / f"{stem}.mp4"
         _encode_local(ffmpeg, src, duration, fade, mp4_path, offset=offset)
 
     if not mp4_path.exists() or mp4_path.stat().st_size == 0:
