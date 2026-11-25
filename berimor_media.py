@@ -382,15 +382,22 @@ def clean_name(name: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 def _download_with_retries(url: str, start_sec: int, end_sec: int,
                            cookies: Path | None, work: Path,
-                           fmt: str = FORMAT_SELECTOR) -> tuple[Path, dict, int]:
+                           fmt: str = FORMAT_SELECTOR,
+                           want_height: int | None = None) -> tuple[Path, dict, int]:
     """
     Try every attempt (client / cookies) as a section download, then as a
     full download. Returns (src, info, offset); offset > 0 means src is the
     whole video and the clip still has to be cut out of it.
+
+    want_height: some clients (tv especially) only offer 360p. If a download
+    comes back lower than this, keep it as a backup but try the remaining
+    clients first, and use the best result.
     """
     attempts = [(c, ck) for c, ck in _attempts() if not (ck and cookies is None)] \
         or [("mweb", False)]
     errors: list[str] = []
+    best: tuple[Path, dict, int] | None = None   # best low-res result so far
+    best_h = 0
 
     for mode in ("section", "full"):
         for n, (client, use_cookies) in enumerate(attempts, 1):
@@ -407,8 +414,15 @@ def _download_with_retries(url: str, start_sec: int, end_sec: int,
                     src, info = _ytdlp_download(url, cookies if use_cookies else None,
                                                 d, client=client, fmt=fmt)
                     offset = start_sec
-                log.info("download OK: %s, %s (after %d failed tries)",
-                         mode, name, len(errors))
+                h = int(info.get("height") or 0)
+                if want_height and h < want_height:
+                    log.info("download OK but only %sp: %s, %s; trying other clients",
+                             h or "?", mode, name)
+                    if best is None or h > best_h:
+                        best, best_h = (src, info, offset), h
+                    continue
+                log.info("download OK: %s, %s, %sp (after %d failed tries)",
+                         mode, name, h or "?", len(errors))
                 return src, info, offset
             except MediaError as e:
                 log.warning("download failed: %s, %s: %s", mode, name, e)
@@ -416,6 +430,12 @@ def _download_with_retries(url: str, start_sec: int, end_sec: int,
                 if "longer than" in str(e):
                     break  # full download skipped for long videos: same for every client
                 time.sleep(2)
+        if best is not None:
+            break  # got a (low-res) result; a full download won't do better
+
+    if best is not None:
+        log.info("no client offered %sp; using the best result (%sp)", want_height, best_h)
+        return best
 
     raise MediaError("YouTube refused every attempt:\n" + "\n".join(errors[-6:]) +
                      "\n\nThis is usually temporary; try again in a few minutes.")
@@ -450,7 +470,8 @@ def download_clip(url: str, start_sec: int, end_sec: int, out_dir: str | os.Path
         work = Path(td)
         src, info, offset = _download_with_retries(
             url, start_sec, end_sec, cookies, work,
-            fmt=AUDIO_FORMAT_SELECTOR if audio else FORMAT_SELECTOR)
+            fmt=AUDIO_FORMAT_SELECTOR if audio else FORMAT_SELECTOR,
+            want_height=None if audio else CANVAS_H)
 
         title    = safe_stem(info.get("title", "clip"))
         video_id = info.get("id", "video")
